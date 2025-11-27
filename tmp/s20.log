@@ -1,0 +1,16 @@
+iperf3: interrupt - the server has terminated
+-----------------------------------------------------------
+Server listening on 5020
+-----------------------------------------------------------
+Accepted connection from 10.0.0.10, port 57824
+[  5] local 10.0.0.20 port 5020 connected to 10.0.0.10 port 57726
+[ ID] Interval           Transfer     Bitrate
+[  5]   0.00-1.01   sec  1.41 KBytes  11.5 Kbits/sec                  
+[  5]   1.01-2.00   sec  2.83 KBytes  23.3 Kbits/sec                  
+[  5]   2.00-3.02   sec  1.41 KBytes  11.4 Kbits/sec                  
+[  5]   3.02-4.01   sec  5.66 KBytes  46.5 Kbits/sec                  
+[  5]   4.01-5.00   sec  2.83 KBytes  23.4 Kbits/sec                  
+[  5]   5.00-5.64   sec  0.00 Bytes  0.00 bits/sec                  
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate
+[  5]   0.00-5.64   sec  14.1 KBytes  20.5 Kbits/sec                  receiver
