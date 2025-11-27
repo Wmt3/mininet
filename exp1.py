@@ -96,11 +96,6 @@ def main():
     
     net.start()
     
-    # TCP congestion control을 reno_custom으로 설정
-    for i in range(1, 21):
-        h = net.getNodeByName(f'h{i}')
-        h.cmd('sysctl -w net.ipv4.tcp_congestion_control=reno_custom')
-    
     time.sleep(1)
     
     results = run_experiment(net, duration=10)
