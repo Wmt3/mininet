@@ -64,6 +64,10 @@ def main():
         h.cmd(f'iperf3 -s -p {port} > /tmp/iperf3_server_{i}.log 2>&1 &')
     time.sleep(2)
     print("  서버 시작 완료")
+    h_send.cmd(
+        f'iperf3 -c {recv_ip} -p {port} -t {duration} -J > {log} 2>&1 &'
+    )
+
 
     duration = 10  # 동시에 10초 동안 전송
     print(f"\n[5] iperf3 클라이언트 동시 실행 (t={duration}s)...")
