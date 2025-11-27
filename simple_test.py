@@ -11,17 +11,27 @@ import json
 import re
 from multiprocessing import Pool
 
-class BottleneckTopology(Topo):
+class RealBottleneckTopology(Topo):
     def build(self):
-        # 간단히 5개로 줄임 (10개는 VM에 부담)
+        # 송신자 그룹
         senders = [self.addHost(f'h{i}') for i in range(1, 6)]
+        # 수신자 그룹  
         receivers = [self.addHost(f'h{i+5}') for i in range(1, 6)]
-        s1 = self.addSwitch('s1', cls=OVSKernelSwitch, failMode='standalone')
         
+        # 두 개의 스위치 + 중간 병목 링크
+        s1 = self.addSwitch('s1')  # 송신자쪽
+        s2 = self.addSwitch('s2')  # 수신자쪽
+        
+        # 송신자 → s1: 고속 링크
         for h in senders:
-            self.addLink(h, s1, cls=TCLink, bw=1, delay='100ms', loss=0)
+            self.addLink(h, s1, cls=TCLink, bw=10, delay='5ms')
+        
+        # ★ 핵심: s1 ↔ s2 병목 링크 (1Mbps, RTT 200ms)
+        self.addLink(s1, s2, cls=TCLink, bw=1, delay='100ms', loss=0)
+        
+        # s2 → 수신자: 고속 링크
         for h in receivers:
-            self.addLink(h, s1, cls=TCLink, bw=1, delay='100ms', loss=0)
+            self.addLink(s2, h, cls=TCLink, bw=10, delay='5ms')
 
 def run_iperf_client(args):
     """병렬 실행용 함수"""
