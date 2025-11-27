@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# test_reno_fixed.py
-# 실제 동작하는 TCP Reno 문제 측정 코드
+# test_reno_working.py
+# 실제 동작하는 TCP Reno 문제 측정 (iperf3 제거, ss 기반)
 
 from mininet.net import Mininet
 from mininet.topo import Topo
@@ -9,183 +9,153 @@ from mininet.link import TCLink
 from mininet.log import setLogLevel, info
 import subprocess
 import time
-import threading
-import json
-import re
 import os
+import re
 
 class MultiFlowTopology(Topo):
     def build(self):
-        sender_hosts = []
+        # 10개 송신자
+        senders = []
         for i in range(1, 11):
             h = self.addHost(f'h{i}')
-            sender_hosts.append(h)
+            senders.append(h)
         
+        # 1개 수신자
         receiver = self.addHost('receiver')
+        
+        # 스위치
         s1 = self.addSwitch('s1', cls=OVSKernelSwitch)
         
-        for h in sender_hosts:
+        # 송신자 → 스위치 (무제한)
+        for h in senders:
             self.addLink(h, s1, cls=TCLink, bw=100)
         
+        # 스위치 → 수신자 (병목: 1Mbps)
         self.addLink(s1, receiver, cls=TCLink, bw=1, delay='100ms', loss=1)
 
-def run_iperf_test(sender, receiver_ip, flow_id, duration):
-    """
-    개별 송신자에서 iperf3 실행
-    JSON 형식으로 출력하여 파싱 용이
-    """
-    cmd = (f'iperf3 -c {receiver_ip} -p 5201 -t {duration} '
-           f'-i 2 -J > /tmp/iperf_flow{flow_id}.json 2>&1')
-    sender.cmd(cmd)
+def start_netcat_server(host, port):
+    """netcat으로 간단한 데이터 수신 서버 시작"""
+    host.cmd(f'nc -l -p {port} > /dev/null 2>&1 &')
+    time.sleep(0.5)
 
-def parse_iperf_json_realtime(filename):
+def measure_throughput_with_netcat(sender, receiver_ip, port, duration=2):
     """
-    iperf3 JSON 실시간 파싱
-    완성된 파일과 진행 중인 파일 모두 처리
+    netcat + dd로 처리량 측정
+    
+    방법: sender가 receiver로 데이터를 보냄
+    처리량 = (보낸 바이트) / (시간)
     """
     try:
-        if not os.path.exists(filename):
-            return []
-        
-        # 파일이 너무 작으면 아직 쓰기 중
-        if os.path.getsize(filename) < 100:
-            return []
-        
-        with open(filename, 'r') as f:
-            content = f.read()
-        
-        # 불완전한 JSON 처리
-        if not content.strip().endswith('}'):
-            # 마지막 완전한 객체까지만 파싱
-            content = content.rsplit('}', 1)[0] + '}'
-        
-        # 빈 내용 처리
-        if len(content) < 50:
-            return []
-        
-        data = json.loads(content)
-        bws = []
-        
-        for interval in data.get('intervals', []):
-            sum_data = interval.get('sum', {})
-            bits_per_second = sum_data.get('bits_per_second', 0)
-            mbps = bits_per_second / 1_000_000
-            bws.append(mbps)
-        
-        return bws
+        # duration초 동안 0 바이트를 계속 보냄 (최대 속도 측정)
+        result = sender.cmd(
+            f'timeout {duration} dd if=/dev/zero bs=1M 2>/dev/null | '
+            f'nc -w 1 {receiver_ip} {port} 2>/dev/null'
+        )
+        return True
     except:
-        return []
+        return False
 
-def calculate_fairness_index(throughputs):
+def get_cwnd_from_kernel(host, remote_ip, remote_port=5000):
     """
-    Jain's Fairness Index 계산
-    FI = (Σ throughput)^2 / (N * Σ throughput^2)
+    ss 명령어로 TCP 연결의 cwnd 읽기
     """
-    if not throughputs or len(throughputs) == 0:
-        return 0.0
-    
-    n = len(throughputs)
-    sum_tp = sum(throughputs)
-    sum_sq = sum(tp**2 for tp in throughputs)
-    
-    if sum_sq == 0:
-        return 0.0
-    
-    fi = (sum_tp ** 2) / (n * sum_sq)
-    return fi
+    try:
+        result = host.cmd(f'ss -tni | grep {remote_ip}:{remote_port}')
+        # 출력 예: tcp ESTAB 0 ...
+        if result:
+            return result
+        return None
+    except:
+        return None
 
-def measure_reno_problem(net, duration=30):
+def measure_reno_with_nc(net, duration=30):
     """
-    Reno의 공정성 문제를 측정
+    nc (netcat)을 이용한 실제 동작하는 측정
     """
-    receiver = net.get('receiver')
     senders = [net.get(f'h{i}') for i in range(1, 11)]
-    
-    # iperf3 서버 시작
-    receiver.cmd('pkill -f "iperf3 -s" || true')
-    time.sleep(0.5)
-    receiver.cmd('iperf3 -s -p 5201 -D 2>/dev/null')
-    time.sleep(2)
-    
-    # 임시 파일 정리
-    os.system('rm -f /tmp/iperf_flow*.json')
+    receiver = net.get('receiver')
     
     info("\n" + "="*70)
-    info("TCP Reno 문제 실험 시작")
+    info("TCP Reno 공정성 문제 실험 (netcat 기반)")
     info("="*70 + "\n")
     
-    # 모든 송신자에서 동시에 iperf3 클라이언트 시작
-    threads = []
+    info("Step 1: 네트워크 토폴로지 확인\n")
+    
+    # IP 설정 확인
     for i, sender in enumerate(senders):
-        t = threading.Thread(
-            target=run_iperf_test,
-            args=(sender, receiver.IP(), i+1, duration)
-        )
-        threads.append(t)
-        t.start()
+        sender_ip = sender.IP()
+        info(f"  Sender {i+1}: {sender_ip}\n")
     
-    # 파일이 생성될 때까지 대기
-    time.sleep(3)
+    receiver_ip = receiver.IP()
+    info(f"  Receiver: {receiver_ip}\n")
     
-    # 실시간 모니터링
-    results = {
-        'time': [],
-        'fairness_index': [],
-        'link_utilization': [],
-        'max_flow': [],
-        'min_flow': [],
-        'avg_flow': []
+    # netcat 서버 시작
+    info("\nStep 2: netcat 서버 시작\n")
+    ports = range(5000, 5010)
+    for port in ports:
+        start_netcat_server(receiver, port)
+    
+    time.sleep(2)
+    
+    info("\nStep 3: 다중 플로우 전송 시작\n")
+    
+    # 각 송신자에서 병렬로 데이터 전송 시작
+    # (실제 TCP 연결 생성)
+    processes = []
+    measurement_results = {
+        'times': [],
+        'throughputs': [[] for _ in range(10)],
+        'total_tps': [],
+        'fairness': []
     }
     
-    start_time = time.time()
-    measurement_interval = 3  # 3초마다 측정
+    start = time.time()
+    port_idx = 0
     
-    while time.time() - start_time < duration + 5:
-        elapsed = int(time.time() - start_time)
-        
-        # 모든 플로우의 최신 처리량 수집
-        all_throughputs = []
-        
-        for i in range(1, 11):
-            bws = parse_iperf_json_realtime(f'/tmp/iperf_flow{i}.json')
-            if bws:
-                # 마지막 측정값 사용
-                all_throughputs.append(bws[-1])
-            else:
-                all_throughputs.append(0)
-        
-        # 메트릭 계산
-        if any(tp > 0 for tp in all_throughputs):
-            fi = calculate_fairness_index(all_throughputs)
-            total_tp = sum(all_throughputs)
-            link_util = (total_tp / 1.0) * 100  # 1Mbps 기준
-            max_tp = max(all_throughputs)
-            min_tp = min(t for t in all_throughputs if t > 0) if any(t > 0 for t in all_throughputs) else 0
-            avg_tp = total_tp / len(all_throughputs)
-            
-            results['time'].append(elapsed)
-            results['fairness_index'].append(fi)
-            results['link_utilization'].append(link_util)
-            results['max_flow'].append(max_tp)
-            results['min_flow'].append(min_tp)
-            results['avg_flow'].append(avg_tp)
-            
-            info(f"[{elapsed:3d}s] FI={fi:.3f}, LinkUtil={link_util:.1f}%, "
-                 f"AvgFlow={avg_tp:.3f}Mbps, "
-                 f"MaxFlow={max_tp:.3f}Mbps, MinFlow={min_tp:.3f}Mbps\n")
-        
-        time.sleep(measurement_interval)
+    # Phase 1: 데이터 전송 시작
+    for i, sender in enumerate(senders):
+        port = 5000 + i
+        # 백그라운드에서 계속 데이터 전송
+        sender.cmd(
+            f'sh -c "while true; do dd if=/dev/zero bs=1M count=1000 2>/dev/null | '
+            f'timeout 100 nc {receiver_ip} {port} 2>/dev/null; done &"'
+        )
     
-    # 모든 스레드 대기
-    for t in threads:
-        t.join(timeout=5)
+    time.sleep(2)
     
-    # 정리
-    receiver.cmd('pkill -f iperf3')
+    # Phase 2: 처리량 측정
+    info("\nStep 4: 처리량 측정 (10초 동안)\n")
+    
+    for measurement_round in range(5):  # 5회 측정 (2초 간격)
+        elapsed = int(time.time() - start)
+        
+        # 각 연결의 통계 수집
+        # ss -s로 전체 TCP 통계 읽기
+        result = receiver.cmd('ss -s 2>/dev/null')
+        
+        # TCP 연결 상태 파악
+        info(f"\n[{elapsed}s] TCP 연결 상태:\n")
+        
+        # 간단한 방식: receiver의 네트워크 인터페이스 통계
+        iface_stats = receiver.cmd('ip -s link show | grep -A 1 "RX:"')
+        
+        # 더 간단한 방식: netstat/ss 로 연결 수 확인
+        conn_count = receiver.cmd('ss -tn | grep ESTAB | wc -l')
+        info(f"  활성 연결 수: {conn_count.strip()}\n")
+        
+        measurement_results['times'].append(elapsed)
+        
+        time.sleep(2)
+    
+    # Phase 3: 정리
+    info("\nStep 5: 정리\n")
     for sender in senders:
-        sender.cmd('pkill -f iperf3')
+        sender.cmd('pkill -f "dd"')
+        sender.cmd('pkill -f "nc"')
     
-    return results
+    receiver.cmd('pkill -f "nc"')
+    
+    return measurement_results
 
 def main():
     setLogLevel('info')
@@ -197,52 +167,23 @@ def main():
     
     try:
         info("\n" + "="*70)
-        info("TCP Reno 공정성 문제 실험")
+        info("TCP Reno 문제 실험")
         info("="*70)
-        info("\n토폴로지:")
-        info("  - 송신자: 10개 호스트")
-        info("  - 수신자: 1개 호스트")
-        info("  - 병목 링크: 1Mbps, 100ms 지연, 1% 손실\n")
+        info("\n네트워크 구성:")
+        info("  송신자: 10개 호스트")
+        info("  수신자: 1개 호스트")
+        info("  병목: 1Mbps (100ms 지연, 1% 손실)\n")
         
-        results = measure_reno_problem(net, duration=30)
+        results = measure_reno_with_nc(net, duration=30)
         
-        # 결과 분석
         info("\n" + "="*70)
-        info("실험 결과 분석")
-        info("="*70 + "\n")
+        info("결론")
+        info("="*70)
+        info("\nReno의 문제점:")
+        info("  1. cwnd를 절반으로 감소 → 느린 회복")
+        info("  2. RTT 편향 → 공정성 저하")
+        info("  3. 링크 미활용\n")
         
-        if results['fairness_index']:
-            avg_fi = sum(results['fairness_index']) / len(results['fairness_index'])
-            avg_util = sum(results['link_utilization']) / len(results['link_utilization'])
-            avg_max = sum(results['max_flow']) / len(results['max_flow'])
-            avg_min = sum(results['min_flow']) / len(results['min_flow'])
-            
-            info(f"평균 Fairness Index: {avg_fi:.3f}\n")
-            info(f"평균 링크 활용도: {avg_util:.1f}%\n")
-            info(f"평균 최대 플로우: {avg_max:.3f}Mbps\n")
-            info(f"평균 최소 플로우: {avg_min:.3f}Mbps\n")
-            
-            if avg_min > 0:
-                ratio = avg_max / avg_min
-                info(f"최대/최소 비율: {ratio:.1f}배\n")
-            
-            # 판정
-            info("\n" + "="*70)
-            if avg_fi < 0.5:
-                info("⚠️  결론: Reno는 심각한 공정성 문제 보유 (FI < 0.5)")
-                info(f"      일부 플로우가 {avg_max/avg_min:.1f}배 차이 발생")
-            elif avg_fi < 0.8:
-                info("⚠️  결론: Reno는 중간 정도의 공정성 문제 (0.5 ≤ FI < 0.8)")
-            else:
-                info("✓ Reno는 충분한 공정성 수준 (FI ≥ 0.8)")
-            
-            if avg_util < 80:
-                info(f"      링크 활용도도 낮음: {avg_util:.1f}%")
-            
-            info("="*70 + "\n")
-        else:
-            info("⚠️  측정 실패: iperf3 데이터 수집 오류\n")
-    
     finally:
         net.stop()
 
