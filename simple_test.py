@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# measure_fixed_server_based.py - server 통계(sum_received) 사용 버전
+# measure_fixed_server_based.py - server sum_received 기준으로 측정 (util/fairness 정확화)
 
 from mininet.net import Mininet
 from mininet.topo import Topo
@@ -16,16 +16,32 @@ class TestTopo(Topo):
         s1 = self.addSwitch('s1', cls=OVSKernelSwitch, failMode='standalone')
         s2 = self.addSwitch('s2', cls=OVSKernelSwitch, failMode='standalone')
 
-        # sender ↔ s1
+        # access 링크
         for h in senders:
             self.addLink(h, s1, cls=TCLink, bw=10, delay='5ms')
 
-        # bottleneck 링크: 1Mbps, RTT≈200ms (편도 100ms)
+        # bottleneck: 1Mbps, 편도 100ms(왕복 ~200ms), 큐 제한
         self.addLink(s1, s2, cls=TCLink, bw=1, delay='100ms', max_queue_size=50)
 
-        # s2 ↔ receiver
         for h in receivers:
             self.addLink(s2, h, cls=TCLink, bw=10, delay='5ms')
+
+
+def wait_for_nonempty_file(host, path, timeout_sec=5.0, interval=0.1):
+    """host(cmd 실행 주체)의 path 파일이 생성되어 0보다 커질 때까지 대기"""
+    waited = 0.0
+    while waited < timeout_sec:
+        # stat -c %s 가 실패하면 빈 문자열 -> int 변환 대비
+        size_str = host.cmd(f'stat -c %s {path} 2>/dev/null').strip()
+        try:
+            size = int(size_str)
+        except:
+            size = 0
+        if size > 0:
+            return True, size
+        time.sleep(interval)
+        waited += interval
+    return False, 0
 
 
 def measure_performance(cc_algo='reno', duration=30):
@@ -38,63 +54,68 @@ def measure_performance(cc_algo='reno', duration=30):
         h = net.get(f'h{i}')
         h.setIP(f'10.0.0.{i}/24', intf=f'h{i}-eth0')
 
-    # 모든 호스트에 동일한 CC 알고리즘 설정
+    # CC 알고리즘 통일
     for i in range(1, 21):
         net.get(f'h{i}').cmd(
             f'sysctl -w net.ipv4.tcp_congestion_control={cc_algo} > /dev/null'
         )
 
-    # ----- iperf3 서버 (receiver) : JSON 로그, sum_received 사용 -----
+    # ----- iperf3 서버: JSON을 stdout으로 파일에 리다이렉션 -----
+    # 참고: -J는 JSON을 stdout으로 출력, --forceflush로 즉시 플러시 가능[web:27][web:24]
+    server_logs = {}
     for i in range(11, 21):
         port = 5000 + i
-        # -1: 한 번 테스트 후 종료, -J: JSON, --logfile: 파일로 출력
+        logp = f'/tmp/s{i}.json'
+        server_logs[i] = logp
+        # -1: 단일 테스트 후 종료, -J: JSON, stdout을 파일로 보냄
         net.get(f'h{i}').cmd(
-            f'iperf3 -s -p {port} -1 -J --logfile /tmp/s{i}.json > /dev/null 2>&1 &'
+            f'iperf3 -s -p {port} -1 -J > {logp} 2>&1 &'
+            # 필요 시 강제 플러시
+            # f'iperf3 -s -p {port} -1 -J --forceflush > {logp} 2>&1 &'
         )
 
-    time.sleep(3)
+    time.sleep(2)
 
-    # ----- iperf3 클라이언트 (sender) -----
+    # ----- iperf3 클라이언트 시작 -----
     for i in range(1, 11):
         dst  = f'10.0.0.{i+10}'
         port = 5000 + i + 10
-        # 클라이언트 로그는 굳이 안 써도 되지만 디버깅용으로 남김
-        log  = f'/tmp/c{i}.json'
+        # 클라 로그는 디버그용
+        clog = f'/tmp/c{i}.json'
         net.get(f'h{i}').cmd(
-            f'iperf3 -c {dst} -p {port} -t {duration} -i 1 -J > {log} 2>&1 &'
+            f'iperf3 -c {dst} -p {port} -t {duration} -i 1 -J > {clog} 2>&1 &'
         )
 
-    # ----- RTT 측정 (ping) -----
+    # ----- RTT 측정 (동시에 핑) -----
     rtt_logs = []
     for i in range(1, 11):
         dst = f'10.0.0.{i+10}'
-        log = f'/tmp/ping{i}.txt'
-        rtt_logs.append((i, log))
-        net.get(f'h{i}').cmd(
-            f'ping -c 20 -i 1.5 {dst} > {log} 2>&1 &'
-        )
+        plog = f'/tmp/ping{i}.txt'
+        rtt_logs.append((i, plog))
+        net.get(f'h{i}').cmd(f'ping -c 20 -i 1.5 {dst} > {plog} 2>&1 &')
 
+    # 대기
     time.sleep(duration + 5)
 
-    # ----- Throughput 수집: receiver JSON sum_received 기준 -----
+    # ----- 서버 JSON 파싱: sum_received 기반 goodput -----
     throughputs = []
     for idx in range(1, 11):
         recv_id = idx + 10
-        log_path = f'/tmp/s{recv_id}.json'
-        out = net.get(f'h{recv_id}').cmd(f'cat {log_path}')
+        logp = server_logs[recv_id]
+        ok, size = wait_for_nonempty_file(net.get(f'h{recv_id}'), logp, timeout_sec=5.0)
+        out = net.get(f'h{recv_id}').cmd(f'cat {logp}')
         try:
             data = json.loads(out)
             bw_mbps = data['end']['sum_received']['bits_per_second'] / 1e6
             throughputs.append(bw_mbps)
-            # 재전송 수는 sender 로그에서 보고 싶으면 별도로 파싱
-            print(f"h{idx} -> h{recv_id}: {bw_mbps:.3f} Mbps")
+            print(f"h{idx} -> h{recv_id}: {bw_mbps:.3f} Mbps (server JSON size={size})")
         except Exception as e:
-            print(f"h{idx} -> h{recv_id}: server JSON 파싱 실패 - {e}")
+            print(f"h{idx} -> h{recv_id}: server JSON 파싱 실패 - {e} (size={size})")
 
     # ----- RTT 수집 -----
     rtts = []
-    for i, log in rtt_logs:
-        out = net.get(f'h{i}').cmd(f'cat {log}')
+    for i, plog in rtt_logs:
+        out = net.get(f'h{i}').cmd(f'cat {plog}')
         for line in out.splitlines():
             if 'rtt min/avg/max' in line:
                 try:
@@ -109,12 +130,9 @@ def measure_performance(cc_algo='reno', duration=30):
 
     # ----- 메트릭 계산 -----
     result = {'cc': cc_algo}
-
     if throughputs:
         total = sum(throughputs)
         bottleneck_bw_mbps = 1.0  # s1-s2 링크 용량
-
-        # 링크 이용률 (goodput 기준)
         result['utilization'] = (total / bottleneck_bw_mbps) * 100.0
 
         n = len(throughputs)
@@ -137,8 +155,7 @@ def measure_performance(cc_algo='reno', duration=30):
 
 if __name__ == '__main__':
     setLogLevel('info')
-
-    print("\n===== Reno Baseline (10 flows, 1Mbps, RTT ~200ms) =====\n")
+    print("\n===== Reno Baseline (10 flows, 1Mbps bottleneck, RTT ~200ms) =====\n")
     result = measure_performance(cc_algo='reno', duration=30)
 
     print(f"\n{'='*50}")
