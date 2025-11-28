@@ -41,7 +41,7 @@ void tcp_reno_cong_avoid(struct sock *sk, u32 ack, u32 acked)
             /* In "congestion avoidance", cwnd is increased by 1 full packet
             * per round-trip time (RTT), which is approximated here by the number of
             * ACKed packets divided by the current congestion window. */
-            // tcp_cong_avoid_ai(tp, tp->snd_cwnd, acked);
+            tcp_cong_avoid_ai(tp, tp->snd_cwnd, acked);
         }
         
         /* Ensure that cwnd does not exceed the maximum allowed value */
@@ -55,6 +55,7 @@ u32 tcp_reno_undo_cwnd(struct sock *sk)
     return tcp_sk(sk)->snd_cwnd;
 }
 
+/* This structure contains the hooks to our congestion control algorithm */
 static struct tcp_congestion_ops tcp_reno_custom = {
     .init           = tcp_reno_init,
     .ssthresh       = tcp_reno_ssthresh,
