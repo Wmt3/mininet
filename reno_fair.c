@@ -2,108 +2,94 @@
 #include <linux/kernel.h>
 #include <net/tcp.h>
 
-/* * 기준 RTT 설정 (단위: 마이크로초)
- * 실험에서 "Fast Group"의 RTT가 약 10ms(10000us)였으므로 이를 기준으로 잡습니다.
- * 이 값보다 RTT가 긴 연결들은 가중치를 받아 더 빨리 성장합니다.
- */
+/* 기준 RTT: 10ms (10000us) */
 #define BASE_RTT_US 10000 
+/* [추가] 가중치 상한선: 과도한 Burst 방지 */
+#define MAX_RATIO 10
 
-void tcp_fair_init(struct sock *sk)
+void tcp_tuned_init(struct sock *sk)
 {
-    /* 초기 변수 설정: 기존 Reno와 동일하게 시작 */
     tcp_sk(sk)->snd_ssthresh = TCP_INFINITE_SSTHRESH;
     tcp_sk(sk)->snd_cwnd = 1;
 }
 
-u32 tcp_fair_ssthresh(struct sock *sk)
+u32 tcp_tuned_ssthresh(struct sock *sk)
 {
-    /* 패킷 손실 시 감소 로직: 기존 Reno와 동일 (반토막) */
     const struct tcp_sock *tp = tcp_sk(sk);
     return max(tp->snd_cwnd >> 1U, 2U);
 }
 
-/* * [핵심 수정 부분] 
- * 혼잡 회피 단계에서 윈도우 증가 로직을 RTT 기반으로 변경 
- */
-void tcp_fair_cong_avoid(struct sock *sk, u32 ack, u32 acked)
+void tcp_tuned_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 {
     struct tcp_sock *tp = tcp_sk(sk);
     
-    // 1. cwnd가 제한된 상태인지 확인 (보낼 데이터가 없으면 증가 안 함)
     if (!tcp_is_cwnd_limited(sk))
         return;
 
-    // 2. Slow Start 구간 (ssthresh보다 작을 때)
+    // Slow Start 구간 (기존과 동일)
     if (tp->snd_cwnd <= tp->snd_ssthresh) {
-        // Slow Start는 기존 Reno와 동일하게 지수적 증가 (RTT 보정 안 함)
         acked = tcp_slow_start(tp, acked);
         if (!acked)
             return;
     } 
-    // 3. Congestion Avoidance 구간 (ssthresh보다 클 때)
+    // Congestion Avoidance 구간 (수정됨)
     else {
-        /* * 여기서 RTT 보정을 수행합니다.
-         * tp->srtt_us: Smoothed RTT (단위가 us * 8 로 저장되어 있음)
-         */
-        u32 current_rtt_us = tp->srtt_us >> 3; // 실제 RTT(us) 추출
+        u32 current_rtt_us = tp->srtt_us >> 3; 
         u32 rtt_ratio = 1;
 
-        // 현재 RTT가 기준(10ms)보다 크면 가중치(ratio)를 계산
         if (current_rtt_us > BASE_RTT_US) {
-            // 예: RTT가 200ms면 ratio는 20이 됨
-            rtt_ratio = current_rtt_us / BASE_RTT_US;
+            // [수정 1] 비율 계산 (Raw Ratio)
+            u32 raw_ratio = current_rtt_us / BASE_RTT_US;
+            
+            // [수정 2] Damping (감쇄): 강도를 절반으로 줄임
+            // (20배 차이나면 -> 10.5배 정도로 보정)
+            rtt_ratio = (raw_ratio + 1) / 2;
+
+            // [수정 3] Capping (상한선): 최대 10배를 넘지 않도록 제한
+            if (rtt_ratio > MAX_RATIO) {
+                rtt_ratio = MAX_RATIO;
+            }
         }
 
-        /* * tcp_cong_avoid_ai 함수는 (acked)만큼 카운터를 올립니다.
-         * 여기서 acked에 rtt_ratio를 곱해서 넘겨줍니다.
-         * 즉, ACK 1개를 받았지만, 마치 ACK 20개를 받은 것처럼 속여서 윈도우를 빨리 키웁니다.
-         */
+        // 보정된 가중치를 적용하여 윈도우 증가
         tcp_cong_avoid_ai(tp, tp->snd_cwnd, acked * rtt_ratio);
     }
 
-    // cwnd가 시스템 MAX치를 넘지 않도록 안전장치
     tp->snd_cwnd = min(tp->snd_cwnd, tp->snd_cwnd_clamp);
 }
 
-u32 tcp_fair_undo_cwnd(struct sock *sk)
+u32 tcp_tuned_undo_cwnd(struct sock *sk)
 {
     return tcp_sk(sk)->snd_cwnd;
 }
 
-/* 모듈 구조체 정의 */
-static struct tcp_congestion_ops tcp_reno_fair = {
-    .init           = tcp_fair_init,
-    .ssthresh       = tcp_fair_ssthresh,
-    .cong_avoid     = tcp_fair_cong_avoid,
-    .undo_cwnd      = tcp_fair_undo_cwnd,
+static struct tcp_congestion_ops tcp_reno_tuned = {
+    .init           = tcp_tuned_init,
+    .ssthresh       = tcp_tuned_ssthresh,
+    .cong_avoid     = tcp_tuned_cong_avoid,
+    .undo_cwnd      = tcp_tuned_undo_cwnd,
 
     .owner          = THIS_MODULE,
-    .name           = "reno_fair", // sysctl에 등록될 이름
+    .name           = "reno_tuned", // 이름 변경
 };
 
-static int __init tcp_fair_module_init(void)
+static int __init tcp_tuned_module_init(void)
 {
-    // 구조체 크기 검증 (안전장치)
-    BUILD_BUG_ON(sizeof(struct tcp_congestion_ops) != sizeof(struct tcp_congestion_ops));
-    
-    // 커널에 알고리즘 등록
-    if (tcp_register_congestion_control(&tcp_reno_fair))
+    if (tcp_register_congestion_control(&tcp_reno_tuned))
         return -ENOBUFS;
-        
-    printk(KERN_INFO "TCP Reno Fair Module Loaded\n");
+    printk(KERN_INFO "TCP Reno Tuned (Damped) Loaded\n");
     return 0;
 }
 
-static void __exit tcp_fair_module_exit(void)
+static void __exit tcp_tuned_module_exit(void)
 {
-    // 커널에서 알고리즘 제거
-    tcp_unregister_congestion_control(&tcp_reno_fair);
-    printk(KERN_INFO "TCP Reno Fair Module Unloaded\n");
+    tcp_unregister_congestion_control(&tcp_reno_tuned);
+    printk(KERN_INFO "TCP Reno Tuned (Damped) Unloaded\n");
 }
 
-module_init(tcp_fair_module_init);
-module_exit(tcp_fair_module_exit);
+module_init(tcp_tuned_module_init);
+module_exit(tcp_tuned_module_exit);
 
 MODULE_AUTHOR("Student");
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("RTT-Fair TCP Reno");
+MODULE_DESCRIPTION("Tuned RTT-Fair TCP Reno");
