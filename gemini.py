@@ -5,6 +5,7 @@ from mininet.link import TCLink
 from mininet.log import setLogLevel, info
 from mininet.cli import CLI
 import time
+import re
 
 class RTTUnfairnessTopo(Topo):
     def build(self):
@@ -27,6 +28,24 @@ class RTTUnfairnessTopo(Topo):
             sender = self.addHost(f'h{i}')
             # delay 100ms -> 왕복 200ms + @ (그룹 A보다 20배 느림)
             self.addLink(sender, s1, cls=TCLink, bw=100, delay='100ms')
+
+def calculate_jains_index(throughputs):
+    """
+    Jain's Fairness Index 계산 함수
+    Formula: (Sum x_i)^2 / (n * Sum (x_i^2))
+    """
+    n = len(throughputs)
+    if n == 0:
+        return 0.0
+
+    sum_x = sum(throughputs)
+    sum_x_sq = sum([x**2 for x in throughputs])
+
+    if sum_x_sq == 0:
+        return 0.0
+
+    jains_index = (sum_x ** 2) / (n * sum_x_sq)
+    return jains_index
 
 def main():
     topo = RTTUnfairnessTopo()
@@ -58,35 +77,29 @@ def main():
     total_bw = 0
     group_a_bw = 0
     group_b_bw = 0
+    
+    # [추가] 개별 throughput을 저장할 리스트 (Jain's Index 계산용)
+    throughput_list = []
 
     print(f"{'Host':<10} {'RTT Group':<15} {'Throughput (Mbps)':<20}")
     print("-" * 45)
 
     for i, sender in enumerate(senders):
         # iperf 결과 파일에서 마지막 줄의 대역폭(bitrate) 파싱
-        # 결과 예: ... 0.00-30.00 sec  15.0 MBytes  4.19 Mbits/sec ...
-        cmd_out = sender.cmd(f'cat {sender.name}_result.txt | grep "sender"').strip()
-        
         try:
-            # grep 결과에서 비트레이트 부분 추출 (단위 변환 필요시 로직 추가)
-            # 여기서는 Mbits/sec로 나온다고 가정하고 숫자만 추출
-            parts = cmd_out.split()
-            # 보통 iperf3 포맷 기준, 뒤에서 3번째가 숫자, 2번째가 단위
-            # iperf2(mininet 기본) 기준으로는 포맷이 다를 수 있어 안전하게 파싱 필요
-            # 아래는 iperf 2.0.x 기준 단순 파싱 예시입니다.
-            # 실제 환경에 따라 'cat' 결과를 직접 보고 인덱스를 조정해야 할 수 있습니다.
-            
             # 간단하게 마지막 reported Bandwidth 라인을 가져옵니다.
             last_line = sender.cmd(f'tail -n 1 {sender.name}_result.txt').strip()
             
             # "Mbits/sec" 앞의 숫자 찾기
-            import re
             match = re.search(r'([\d\.]+)\s+Mbits/sec', last_line)
             if match:
                 bw = float(match.group(1))
             else:
                 bw = 0.0 # 파싱 실패 시 0 처리
             
+            # [추가] 리스트에 개별 대역폭 저장
+            throughput_list.append(bw)
+
             total_bw += bw
             if i < 3: # h1~h3
                 group_a_bw += bw
@@ -99,25 +112,32 @@ def main():
 
         except Exception as e:
             print(f"Error parsing {sender.name}: {e}")
+            throughput_list.append(0.0)
 
     print("-" * 45)
     print(f"Total Bandwidth: {total_bw:.2f} Mbps")
+    
     if total_bw > 0:
         print(f"Group A (Fast) Share: {(group_a_bw/total_bw)*100:.1f}%")
         print(f"Group B (Slow) Share: {(group_b_bw/total_bw)*100:.1f}%")
     
-    # Fairness Index (Jain's Fairness Index) 계산
-    # (Sum x_i)^2 / (n * Sum x_i^2)
-    sum_x = group_a_bw + group_b_bw
-    sum_x_sq = 0
-    # 개별 bw 리스트가 필요하므로 다시 수집하지 않고 위에서 합산한걸로 약식 계산보다는
-    # 정확한 계산을 위해 리스트에 담는게 좋으나, 여기서는 그룹 간 격차만 봐도 충분함.
+    print("\n=== 4. Quantitative Fairness Measure ===")
+    
+    # [추가] Jain's Fairness Index 계산 및 출력
+    j_index = calculate_jains_index(throughput_list)
+    
+    print(f"Throughput Distribution: {throughput_list}")
+    print(f"Jain's Fairness Index: {j_index:.4f}")
     
     print("\n[Conclusion]")
-    if group_a_bw > group_b_bw * 2:
-        print("=> RTT Unfairness DETECTED: Fast RTT flows are dominating the link.")
+    if j_index >= 0.9:
+        print("=> Fairness Index is high (Close to 1.0). The network is FAIR.")
+    elif j_index < 0.8:
+         print(f"=> Fairness Index is LOW ({j_index:.4f}). The network is UNFAIR.")
+         if group_a_bw > group_b_bw * 2:
+             print("   (Fast RTT flows are dominating the link)")
     else:
-        print("=> Fairness looks okay (Unexpected for Reno).")
+        print("=> Fairness Index is moderate.")
 
     # Clean up
     h_recv.cmd('killall -9 iperf')
