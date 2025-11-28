@@ -18,7 +18,7 @@ class RTTUnfairnessTopo(Topo):
 
         # [병목 링크] Server <-> Switch
         # bw=10Mbps, 큐 크기 20 (Reno의 약점인 Bufferbloat 및 경쟁 유발)
-        self.addLink(receiver, s1, cls=TCLink, bw=BOTTLENECK_BW, max_queue_size=50)
+        self.addLink(receiver, s1, cls=TCLink, bw=BOTTLENECK_BW, max_queue_size=150)
 
         # [그룹 A: 빠른 녀석들] h1~h3 (RTT ~10ms)
         for i in range(1, 4):
