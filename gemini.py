@@ -7,6 +7,9 @@ from mininet.cli import CLI
 import time
 import re
 
+# 병목 링크 대역폭 설정 (계산에 사용하기 위해 상수로 정의)
+BOTTLENECK_BW = 10 
+
 class RTTUnfairnessTopo(Topo):
     def build(self):
         # 수신자 (Server)
@@ -14,38 +17,27 @@ class RTTUnfairnessTopo(Topo):
         s1 = self.addSwitch('s1')
 
         # [병목 링크] Server <-> Switch
-        # 20Mbps 대역폭, 큐 크기 제한 (Bufferbloat 방지용)
-        self.addLink(receiver, s1, cls=TCLink, bw=20, max_queue_size=100)
+        # bw=10Mbps, 큐 크기 20 (Reno의 약점인 Bufferbloat 및 경쟁 유발)
+        self.addLink(receiver, s1, cls=TCLink, bw=BOTTLENECK_BW, max_queue_size=20)
 
         # [그룹 A: 빠른 녀석들] h1~h3 (RTT ~10ms)
         for i in range(1, 4):
             sender = self.addHost(f'h{i}')
-            # delay 5ms -> 왕복 10ms + @
             self.addLink(sender, s1, cls=TCLink, bw=100, delay='5ms')
         
         # [그룹 B: 느린 녀석들] h4~h6 (RTT ~200ms)
         for i in range(4, 7):
             sender = self.addHost(f'h{i}')
-            # delay 100ms -> 왕복 200ms + @ (그룹 A보다 20배 느림)
             self.addLink(sender, s1, cls=TCLink, bw=100, delay='100ms')
 
 def calculate_jains_index(throughputs):
-    """
-    Jain's Fairness Index 계산 함수
-    Formula: (Sum x_i)^2 / (n * Sum (x_i^2))
-    """
+    """ Jain's Fairness Index 계산 """
     n = len(throughputs)
-    if n == 0:
-        return 0.0
-
+    if n == 0: return 0.0
     sum_x = sum(throughputs)
     sum_x_sq = sum([x**2 for x in throughputs])
-
-    if sum_x_sq == 0:
-        return 0.0
-
-    jains_index = (sum_x ** 2) / (n * sum_x_sq)
-    return jains_index
+    if sum_x_sq == 0: return 0.0
+    return (sum_x ** 2) / (n * sum_x_sq)
 
 def main():
     topo = RTTUnfairnessTopo()
@@ -53,61 +45,62 @@ def main():
     net.start()
 
     h_recv = net.get('h_recv')
+    h1 = net.get('h1') # Latency 측정용 (Fast Group 대표)
     senders = [net.get(f'h{i}') for i in range(1, 7)]
 
     info("=== 1. Starting iperf Server ===\n")
     h_recv.cmd('iperf -s &')
 
-    info("=== 2. Starting 6 TCP Flows (Reno) ===\n")
-    info("Group A (Fast RTT): h1, h2, h3\n")
-    info("Group B (Slow RTT): h4, h5, h6\n")
-    
-    # 모든 호스트가 동시에 전송 시작 (30초간)
+    info("=== 2. Starting 6 TCP Flows (Generating Congestion) ===\n")
+    # 모든 호스트가 동시에 전송 시작 (40초간)
     for sender in senders:
-        sender.cmd(f'iperf -c {h_recv.IP()} -t 30 -i 10 > {sender.name}_result.txt &')
+        sender.cmd(f'iperf -c {h_recv.IP()} -t 40 -i 10 > {sender.name}_result.txt &')
 
-    info("=== Test Running (30s)... ===\n")
-    
-    # 실시간 모니터링을 위해 잠시 대기
-    time.sleep(35)
+    info("=== Test Running... Waiting for congestion to build up (10s) ===\n")
+    time.sleep(10)
 
-    info("=== 3. Analyzing Fairness ===\n")
+    # [추가됨] Latency 측정
+    info("=== 3. Measuring Latency (RTT) under Load ===\n")
+    # 혼잡한 상황에서 h1이 h_recv에게 핑을 보냄
+    ping_out = h1.cmd(f'ping -c 10 {h_recv.IP()}')
     
-    # 결과 파싱 및 출력
+    # Ping 결과 파싱
+    rtt_avg = 0.0
+    try:
+        # rtt min/avg/max/mdev = 20.1/25.2/30.5/1.2 ms 형태 파싱
+        rtt_line = ping_out.splitlines()[-1]
+        match = re.search(r'([\d\.]+)/([\d\.]+)/([\d\.]+)/([\d\.]+)', rtt_line)
+        if match:
+            rtt_avg = float(match.group(2)) # avg 값 추출
+        info(f"Ping Output: {rtt_line}\n")
+    except Exception as e:
+        info(f"Ping Parse Error: {e}\n")
+
+    info("=== Waiting for test to finish (Remaining time) ===\n")
+    time.sleep(25) # 남은 시간 대기
+
+    info("=== 4. Collecting Results ===\n")
+    
     total_bw = 0
-    group_a_bw = 0
-    group_b_bw = 0
-    
-    # [추가] 개별 throughput을 저장할 리스트 (Jain's Index 계산용)
     throughput_list = []
 
     print(f"{'Host':<10} {'RTT Group':<15} {'Throughput (Mbps)':<20}")
     print("-" * 45)
 
     for i, sender in enumerate(senders):
-        # iperf 결과 파일에서 마지막 줄의 대역폭(bitrate) 파싱
         try:
-            # 간단하게 마지막 reported Bandwidth 라인을 가져옵니다.
+            # iperf 결과 파일 파싱
             last_line = sender.cmd(f'tail -n 1 {sender.name}_result.txt').strip()
-            
-            # "Mbits/sec" 앞의 숫자 찾기
             match = re.search(r'([\d\.]+)\s+Mbits/sec', last_line)
             if match:
                 bw = float(match.group(1))
             else:
-                bw = 0.0 # 파싱 실패 시 0 처리
+                bw = 0.0
             
-            # [추가] 리스트에 개별 대역폭 저장
             throughput_list.append(bw)
-
             total_bw += bw
-            if i < 3: # h1~h3
-                group_a_bw += bw
-                group_str = "Fast (10ms)"
-            else: # h4~h6
-                group_b_bw += bw
-                group_str = "Slow (200ms)"
             
+            group_str = "Fast (10ms)" if i < 3 else "Slow (200ms)"
             print(f"{sender.name:<10} {group_str:<15} {bw:.2f}")
 
         except Exception as e:
@@ -115,29 +108,32 @@ def main():
             throughput_list.append(0.0)
 
     print("-" * 45)
-    print(f"Total Bandwidth: {total_bw:.2f} Mbps")
-    
-    if total_bw > 0:
-        print(f"Group A (Fast) Share: {(group_a_bw/total_bw)*100:.1f}%")
-        print(f"Group B (Slow) Share: {(group_b_bw/total_bw)*100:.1f}%")
-    
-    print("\n=== 4. Quantitative Fairness Measure ===")
-    
-    # [추가] Jain's Fairness Index 계산 및 출력
+
+    # [분석 1] Fairness (공정성)
     j_index = calculate_jains_index(throughput_list)
+
+    # [분석 2] Link Utilization (링크 효율)
+    # 총 처리량 / 병목 대역폭 * 100
+    utilization = (total_bw / BOTTLENECK_BW) * 100
     
-    print(f"Throughput Distribution: {throughput_list}")
-    print(f"Jain's Fairness Index: {j_index:.4f}")
+    # [분석 3] Latency (지연 시간) - 위에서 측정한 rtt_avg 사용
+
+    print("\n========= FINAL ANALYSIS REPORT =========")
+    print(f"[1] Link Utilization: {utilization:.2f}%")
+    print(f"    - Target: Close to 100% (approx 90-95% is realistic for TCP)")
+    print(f"    - Current Total Throughput: {total_bw:.2f} Mbps / {BOTTLENECK_BW} Mbps")
     
-    print("\n[Conclusion]")
-    if j_index >= 0.9:
-        print("=> Fairness Index is high (Close to 1.0). The network is FAIR.")
-    elif j_index < 0.8:
-         print(f"=> Fairness Index is LOW ({j_index:.4f}). The network is UNFAIR.")
-         if group_a_bw > group_b_bw * 2:
-             print("   (Fast RTT flows are dominating the link)")
+    print(f"\n[2] Latency (Bufferbloat): {rtt_avg:.2f} ms")
+    print(f"    - Base RTT: approx 10ms")
+    print(f"    - If this value is high (>100ms), Reno is causing Bufferbloat.")
+    
+    print(f"\n[3] Fairness (Jain's Index): {j_index:.4f}")
+    if j_index < 0.8:
+        print("    - Result: UNFAIR. Fast RTT flows are likely dominating.")
     else:
-        print("=> Fairness Index is moderate.")
+        print("    - Result: FAIR.")
+    
+    print("=========================================")
 
     # Clean up
     h_recv.cmd('killall -9 iperf')
