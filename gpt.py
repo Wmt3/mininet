@@ -13,16 +13,13 @@ DURATION = 30              # 초
 
 class MssBiasTopo(Topo):
     def build(self):
-        # 6 senders: h1..h6, 1 server: h7
         for i in range(1, 8):
             self.addHost(f'h{i}')
         s1 = self.addSwitch('s1', cls=OVSKernelSwitch, failMode='standalone')
         s2 = self.addSwitch('s2', cls=OVSKernelSwitch, failMode='standalone')
-        # 접속 링크는 충분히 여유
         for i in range(1, 7):
             self.addLink(f'h{i}', s1, cls=TCLink, bw=50, delay='5ms')
         self.addLink(s2, 'h7', cls=TCLink, bw=50, delay='5ms')
-        # 병목 링크: 2 Mbps, 편도 50ms, 큐 제한
         self.addLink(s1, s2, cls=TCLink, bw=BOTTLENECK_Mbps, delay=ONEWAY_DELAY, max_queue_size=50)
 
 def wait_nonempty(host, path, timeout=5.0, interval=0.1):
@@ -101,8 +98,8 @@ def measure(cc_algo='reno', duration=DURATION):
         n = len(tputs)
         s = sum(tputs)
         sq = sum(x*x for x in tputs)
-        res['utilization'] = (total / BOTTLENECK_Mbps) * 100.0     # goodput 기준
-        res['fairness']    = (s*s)/(n*sq) if sq>0 else 0.0          # Jain index
+        res['utilization'] = (total / BOTTLENECK_Mbps) * 100.0   
+        res['fairness']    = (s*s)/(n*sq) if sq>0 else 0.0      
         res['throughputs'] = tputs
         res['avg_tput']    = total/n
         res['min_tput']    = min(tputs); res['max_tput']=max(tputs)
