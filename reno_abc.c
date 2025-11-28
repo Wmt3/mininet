@@ -82,8 +82,8 @@ static void __exit tcp_reno_module_exit(void)
     tcp_unregister_congestion_control(&tcp_reno_custom);
 }
 
-module_init(tcp_reno_register);
-module_exit(tcp_reno_unregister);
+module_init(tcp_reno_module_init);
+module_exit(tcp_reno_module_exit);
 
 MODULE_AUTHOR("nethw");
 MODULE_LICENSE("GPL");
