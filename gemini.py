@@ -8,7 +8,7 @@ import time
 import re
 
 # 병목 링크 대역폭 설정 (계산에 사용하기 위해 상수로 정의)
-BOTTLENECK_BW = 10 
+BOTTLENECK_BW = 20
 
 class RTTUnfairnessTopo(Topo):
     def build(self):
